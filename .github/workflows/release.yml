@@ -1,0 +1,105 @@
+name: LinkLock signed release
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_base:
+        description: Public HTTPS base URL of the deployed LinkLock Worker
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check Worker and run its tests
+        run: |
+          node --check server/src/index.js
+          cd server && npm test
+      - name: Validate signing secrets
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.LINKLOCK_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.LINKLOCK_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.LINKLOCK_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.LINKLOCK_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_B64" || { echo 'Missing LINKLOCK_KEYSTORE_BASE64'; exit 1; }
+          test -n "$STORE_PASSWORD" || { echo 'Missing LINKLOCK_KEYSTORE_PASSWORD'; exit 1; }
+          test -n "$KEY_ALIAS" || { echo 'Missing LINKLOCK_KEY_ALIAS'; exit 1; }
+          test -n "$KEY_PASSWORD" || { echo 'Missing LINKLOCK_KEY_PASSWORD'; exit 1; }
+          mkdir -p "$RUNNER_TEMP/linklock-signing"
+          KEYSTORE_FILE="$RUNNER_TEMP/linklock-signing/linklock-release.jks"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE_FILE"
+          test -s "$KEYSTORE_FILE"
+          # Verify the store password, alias and certificate before Gradle starts.
+          STORE_PASSWORD="$STORE_PASSWORD" keytool -list -v \
+            -keystore "$KEYSTORE_FILE" -storetype JKS \
+            -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" \
+            > "$RUNNER_TEMP/linklock-signing/keystore-check.txt"
+          grep -q 'PrivateKeyEntry' "$RUNNER_TEMP/linklock-signing/keystore-check.txt" || {
+            echo 'The selected alias is not a private signing key.'; exit 1;
+          }
+          grep -Eq 'Certificate chain length: [1-9][0-9]*' \
+            "$RUNNER_TEMP/linklock-signing/keystore-check.txt" || {
+            echo 'The keystore entry has no certificate chain.'; exit 1;
+          }
+          echo 'Release keystore and alias validated.'
+      - name: Resolve dependencies
+        run: flutter pub get
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.3.1
+      - name: Prepare Android Gradle wrapper omitted from source archive
+        shell: bash
+        run: |
+          FLUTTER_BIN="$(command -v flutter)"
+          FLUTTER_SDK="$(cd "$(dirname "$FLUTTER_BIN")/.." && pwd)"
+          printf 'flutter.sdk=%s\n' "$FLUTTER_SDK" > android/local.properties
+          cd android
+          gradle wrapper --gradle-version 9.3.1 --distribution-type all --no-daemon
+      - name: Format Dart sources
+        run: dart format --output=none --set-exit-if-changed lib test
+      - name: Analyze Dart sources
+        run: flutter analyze --fatal-infos
+      - name: Run Flutter tests
+        run: flutter test --reporter expanded
+      - name: Build signed release APK
+        shell: bash
+        env:
+          LINKLOCK_KEYSTORE_PATH: ${{ runner.temp }}/linklock-signing/linklock-release.jks
+          LINKLOCK_KEYSTORE_TYPE: JKS
+          LINKLOCK_KEYSTORE_PASSWORD: ${{ secrets.LINKLOCK_KEYSTORE_PASSWORD }}
+          LINKLOCK_KEY_ALIAS: ${{ secrets.LINKLOCK_KEY_ALIAS }}
+          LINKLOCK_KEY_PASSWORD: ${{ secrets.LINKLOCK_KEY_PASSWORD }}
+          LINKLOCK_API_BASE: ${{ inputs.api_base }}
+        run: |
+          set -euo pipefail
+          case "$LINKLOCK_API_BASE" in
+            https://*) ;;
+            *) echo 'api_base must be a public HTTPS Worker URL.'; exit 1 ;;
+          esac
+          flutter build apk --release --dart-define="LINKLOCK_API_BASE=$LINKLOCK_API_BASE"
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: linklock-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
