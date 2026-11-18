@@ -1,0 +1,86 @@
+name: LinkLock CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  worker-tests:
+    name: Cloudflare Worker tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check Worker syntax
+        run: node --check server/src/index.js
+      - name: Run Worker tests
+        working-directory: server
+        run: npm test
+      - name: Validate D1 migrations and Worker configuration
+        run: |
+          python3 - <<'PYCODE'
+          import sqlite3
+          import tomllib
+          from pathlib import Path
+
+          db = sqlite3.connect(':memory:')
+          for migration in sorted(Path('server/migrations').glob('*.sql')):
+              db.executescript(migration.read_text(encoding='utf-8'))
+          columns = {row[1] for row in db.execute('PRAGMA table_info(shares)')}
+          assert 'key_id' in columns
+          assert db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='abuse_reports'").fetchone()
+
+          config = tomllib.loads(Path('server/wrangler.toml').read_text(encoding='utf-8'))
+          assert len(config['d1_databases']) == 1
+          assert len(config['ratelimits']) == 2
+          assert all(binding['simple']['period'] in (10, 60) for binding in config['ratelimits'])
+          print('D1 migrations and Wrangler configuration are valid.')
+          PYCODE
+
+  flutter-checks:
+    name: Flutter analysis, tests and debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve Flutter dependencies
+        run: flutter pub get
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.3.1
+      - name: Prepare Android Gradle wrapper omitted from source archive
+        shell: bash
+        run: |
+          FLUTTER_BIN="$(command -v flutter)"
+          FLUTTER_SDK="$(cd "$(dirname "$FLUTTER_BIN")/.." && pwd)"
+          printf 'flutter.sdk=%s\n' "$FLUTTER_SDK" > android/local.properties
+          cd android
+          gradle wrapper --gradle-version 9.3.1 --distribution-type all --no-daemon
+      - name: Format Dart sources
+        run: dart format --output=none --set-exit-if-changed lib test
+      - name: Analyze Dart sources
+        run: flutter analyze --fatal-infos
+      - name: Run Flutter tests
+        run: flutter test --reporter expanded
+      - name: Build debug APK
+        run: flutter build apk --debug
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: linklock-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
